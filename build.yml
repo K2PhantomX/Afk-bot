@@ -1,0 +1,382 @@
+name: Build AFK Rejoin mod
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '9.2.1'
+
+      - name: Write project files
+        run: |
+          mkdir -p src/main/java/com/afkrejoin src/main/resources
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories {
+                  maven {
+                      name = 'Fabric'
+                      url = 'https://maven.fabricmc.net/'
+                  }
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          rootProject.name = 'afk-rejoin'
+          EOF
+          cat > build.gradle <<'EOF'
+          plugins {
+              id 'fabric-loom' version '1.14-SNAPSHOT'
+          }
+
+          version = '1.1.0'
+          group = 'com.afkrejoin'
+
+          base {
+              archivesName = 'afk-rejoin'
+          }
+
+          repositories {
+              maven {
+                  url = 'https://maven.fabricmc.net/'
+              }
+          }
+
+          dependencies {
+              minecraft 'com.mojang:minecraft:1.21.11'
+              mappings 'net.fabricmc:yarn:1.21.11+build.4:v2'
+              modImplementation 'net.fabricmc:fabric-loader:0.18.4'
+              modImplementation 'net.fabricmc.fabric-api:fabric-api:0.141.1+1.21.11'
+          }
+
+          tasks.withType(JavaCompile).configureEach {
+              options.release = 21
+              options.encoding = 'UTF-8'
+          }
+
+          java {
+              sourceCompatibility = JavaVersion.VERSION_21
+              targetCompatibility = JavaVersion.VERSION_21
+          }
+          EOF
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2G
+          EOF
+          cat > src/main/resources/fabric.mod.json <<'EOF'
+          {
+            "schemaVersion": 1,
+            "id": "afkrejoin",
+            "version": "1.1.0",
+            "name": "AFK Rejoin",
+            "description": "Reconnects after a kick, runs /login, then the server command.",
+            "authors": [],
+            "license": "MIT",
+            "environment": "client",
+            "entrypoints": {
+              "client": ["com.afkrejoin.AfkRejoinClient"]
+            },
+            "depends": {
+              "fabricloader": ">=0.16.0",
+              "minecraft": "1.21.11",
+              "java": ">=21",
+              "fabric-api": "*"
+            }
+          }
+          EOF
+          cat > src/main/java/com/afkrejoin/AfkRejoinClient.java <<'EOF'
+          package com.afkrejoin;
+
+          import com.google.gson.Gson;
+          import com.google.gson.GsonBuilder;
+          import com.mojang.brigadier.CommandDispatcher;
+          import com.mojang.brigadier.arguments.IntegerArgumentType;
+          import com.mojang.brigadier.arguments.StringArgumentType;
+          import com.mojang.brigadier.context.CommandContext;
+          import net.fabricmc.api.ClientModInitializer;
+          import net.fabricmc.fabric.api.client.command.v2.ClientCommandManager;
+          import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
+          import net.fabricmc.fabric.api.client.command.v2.FabricClientCommandSource;
+          import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+          import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
+          import net.fabricmc.loader.api.FabricLoader;
+          import net.minecraft.client.MinecraftClient;
+          import net.minecraft.client.gui.screen.DisconnectedScreen;
+          import net.minecraft.client.gui.screen.Screen;
+          import net.minecraft.client.gui.screen.TitleScreen;
+          import net.minecraft.client.gui.screen.multiplayer.ConnectScreen;
+          import net.minecraft.client.gui.screen.multiplayer.MultiplayerScreen;
+          import net.minecraft.client.network.ServerAddress;
+          import net.minecraft.client.network.ServerInfo;
+          import net.minecraft.text.Text;
+          import org.slf4j.Logger;
+          import org.slf4j.LoggerFactory;
+
+          import java.io.IOException;
+          import java.io.Reader;
+          import java.nio.file.Files;
+          import java.nio.file.Path;
+
+          public class AfkRejoinClient implements ClientModInitializer {
+              private static final Logger LOG = LoggerFactory.getLogger("afk-rejoin");
+              private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
+
+              private enum Phase { IDLE, LOGIN, SERVER }
+
+              public static class Config {
+                  public boolean enabled = true;
+                  public String password = "";
+                  public int reconnectDelaySeconds = 5;
+                  public int loginDelaySeconds = 3;
+                  public int serverDelaySeconds = 5;
+                  public String serverCommand = "server lifesteal";
+              }
+
+              private Config cfg = new Config();
+              private Path cfgPath;
+
+              private ServerInfo lastServer;
+              private Screen lastDisconnectScreen;
+              private int reconnectTimer;
+              private int reconnectCount;
+
+              private Phase phase = Phase.IDLE;
+              private int timer;
+              private int sinceServerCmd = 100000;
+
+              @Override
+              public void onInitializeClient() {
+                  cfgPath = FabricLoader.getInstance().getConfigDir().resolve("afk-rejoin-simple.json");
+                  loadConfig();
+
+                  ClientPlayConnectionEvents.JOIN.register((handler, sender, client) -> {
+                      ServerInfo info = client.getCurrentServerEntry();
+                      if (info == null) {
+                          return;
+                      }
+                      lastServer = info;
+                      onJoin();
+                  });
+
+                  ClientTickEvents.END_CLIENT_TICK.register(this::tick);
+
+                  ClientCommandRegistrationCallback.EVENT.register(
+                          (dispatcher, registryAccess) -> registerCommands(dispatcher));
+              }
+
+              // ---------------------------------------------------------------- config
+
+              private void loadConfig() {
+                  try {
+                      if (Files.exists(cfgPath)) {
+                          try (Reader r = Files.newBufferedReader(cfgPath)) {
+                              Config c = GSON.fromJson(r, Config.class);
+                              if (c != null) {
+                                  cfg = c;
+                              }
+                          }
+                      }
+                      saveConfig();
+                  } catch (Exception e) {
+                      LOG.error("Could not load config", e);
+                  }
+              }
+
+              private void saveConfig() {
+                  try {
+                      Files.writeString(cfgPath, GSON.toJson(cfg));
+                  } catch (IOException e) {
+                      LOG.error("Could not save config", e);
+                  }
+              }
+
+              // ---------------------------------------------------------------- events
+
+              private void onJoin() {
+                  if (!cfg.enabled) {
+                      return;
+                  }
+                  reconnectCount = 0;
+                  if (sinceServerCmd < 300) {
+                      // A join right after the server command is part of the server switch itself.
+                      return;
+                  }
+                  startSequence(cfg.loginDelaySeconds);
+              }
+
+              private void startSequence(int delaySeconds) {
+                  phase = cfg.password.isEmpty() ? Phase.SERVER : Phase.LOGIN;
+                  timer = Math.max(0, delaySeconds) * 20;
+              }
+
+              private void tick(MinecraftClient client) {
+                  if (sinceServerCmd < 100000) {
+                      sinceServerCmd++;
+                  }
+
+                  Screen screen = client.currentScreen;
+                  if (screen instanceof DisconnectedScreen) {
+                      phase = Phase.IDLE;
+                      handleDisconnected(client, screen);
+                      return;
+                  }
+
+                  if (phase == Phase.IDLE) {
+                      return;
+                  }
+                  if (client.player == null || client.world == null) {
+                      return;
+                  }
+                  if (timer > 0) {
+                      timer--;
+                      return;
+                  }
+
+                  if (phase == Phase.LOGIN) {
+                      say(client, "Logging in...");
+                      client.player.networkHandler.sendChatCommand("login " + cfg.password);
+                      phase = Phase.SERVER;
+                      timer = Math.max(0, cfg.serverDelaySeconds) * 20;
+                  } else if (phase == Phase.SERVER) {
+                      say(client, "Sending /" + stripSlash(cfg.serverCommand));
+                      client.player.networkHandler.sendChatCommand(stripSlash(cfg.serverCommand));
+                      phase = Phase.IDLE;
+                      sinceServerCmd = 0;
+                  }
+              }
+
+              // ------------------------------------------------------------ reconnect
+
+              private void handleDisconnected(MinecraftClient client, Screen screen) {
+                  if (!cfg.enabled || lastServer == null) {
+                      return;
+                  }
+                  if (screen != lastDisconnectScreen) {
+                      lastDisconnectScreen = screen;
+                      reconnectTimer = Math.max(1, cfg.reconnectDelaySeconds) * 20;
+                  }
+                  reconnectTimer--;
+                  if (reconnectTimer <= 0) {
+                      reconnectCount++;
+                      LOG.info("Reconnecting to {} (attempt {})", lastServer.address, reconnectCount);
+                      ConnectScreen.connect(
+                              new MultiplayerScreen(new TitleScreen()),
+                              client,
+                              ServerAddress.parse(lastServer.address),
+                              lastServer,
+                              false,
+                              null);
+                  }
+              }
+
+              // -------------------------------------------------------------- helpers
+
+              private static String stripSlash(String s) {
+                  return s.startsWith("/") ? s.substring(1) : s;
+              }
+
+              private void say(MinecraftClient client, String msg) {
+                  LOG.info(msg);
+                  if (client.player != null) {
+                      client.player.sendMessage(Text.literal("[AFK Rejoin] " + msg), false);
+                  }
+              }
+
+              private static void reply(CommandContext<FabricClientCommandSource> ctx, String msg) {
+                  ctx.getSource().sendFeedback(Text.literal("[AFK Rejoin] " + msg));
+              }
+
+              private String status() {
+                  return "enabled=" + cfg.enabled
+                          + ", password=" + (cfg.password.isEmpty() ? "NOT set" : "set")
+                          + ", phase=" + phase
+                          + ", reconnects=" + reconnectCount
+                          + ", reconnectDelay=" + cfg.reconnectDelaySeconds + "s"
+                          + ", server command=/" + stripSlash(cfg.serverCommand)
+                          + ", server=" + (lastServer == null ? "none yet" : lastServer.address);
+              }
+
+              // ------------------------------------------------------------- commands
+
+              private void registerCommands(CommandDispatcher<FabricClientCommandSource> d) {
+                  d.register(ClientCommandManager.literal("afkbot")
+                          .then(ClientCommandManager.literal("on").executes(c -> {
+                              cfg.enabled = true;
+                              saveConfig();
+                              reply(c, "Enabled.");
+                              return 1;
+                          }))
+                          .then(ClientCommandManager.literal("off").executes(c -> {
+                              cfg.enabled = false;
+                              phase = Phase.IDLE;
+                              saveConfig();
+                              reply(c, "Disabled.");
+                              return 1;
+                          }))
+                          .then(ClientCommandManager.literal("now").executes(c -> {
+                              startSequence(0);
+                              reply(c, "Running /login then the server command now.");
+                              return 1;
+                          }))
+                          .then(ClientCommandManager.literal("status").executes(c -> {
+                              reply(c, status());
+                              return 1;
+                          }))
+                          .then(ClientCommandManager.literal("password")
+                                  .then(ClientCommandManager.argument("value", StringArgumentType.greedyString())
+                                          .executes(c -> {
+                                              cfg.password = StringArgumentType.getString(c, "value");
+                                              saveConfig();
+                                              reply(c, "Password saved.");
+                                              return 1;
+                                          })))
+                          .then(ClientCommandManager.literal("server")
+                                  .then(ClientCommandManager.argument("command", StringArgumentType.greedyString())
+                                          .executes(c -> {
+                                              cfg.serverCommand = StringArgumentType.getString(c, "command");
+                                              saveConfig();
+                                              reply(c, "Server command set to /" + stripSlash(cfg.serverCommand) + ".");
+                                              return 1;
+                                          })))
+                          .then(ClientCommandManager.literal("delay")
+                                  .then(ClientCommandManager.argument("seconds", IntegerArgumentType.integer(3, 600))
+                                          .executes(c -> {
+                                              cfg.reconnectDelaySeconds = IntegerArgumentType.getInteger(c, "seconds");
+                                              saveConfig();
+                                              reply(c, "Reconnect delay set to " + cfg.reconnectDelaySeconds + "s.");
+                                              return 1;
+                                          }))));
+              }
+          }
+          EOF
+
+      - name: Build
+        run: gradle build --no-daemon
+
+      - name: Upload jar as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: afk-rejoin-mod
+          path: build/libs/afk-rejoin-1.1.0.jar
+
+      - name: Publish jar as a release (easy download)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "build-${{ github.run_number }}" build/libs/afk-rejoin-1.1.0.jar \
+            --title "AFK Rejoin build ${{ github.run_number }}" \
+            --notes "Fabric 1.21.11 client mod"
